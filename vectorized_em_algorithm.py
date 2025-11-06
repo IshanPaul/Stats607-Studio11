@@ -24,7 +24,7 @@ def _plot_gaussian_ellipse(mu, cov, ax, color, alpha=0.3, label=None):
                      facecolor=color, alpha=alpha, edgecolor=color, linewidth=2, label=label)
     ax.add_patch(ellipse)
         
-class GaussianMixtureModel:
+class GaussianMixtureModelVectorized:
     """
     Gaussian Mixture Model fitted using the EM algorithm.
     
@@ -139,29 +139,27 @@ class GaussianMixtureModel:
             Posterior probabilities that each point belongs to each component
         """
         n_samples = X.shape[0]
-        responsibilities = np.zeros((n_samples, self.n_components))
+        log_responsibilities = np.zeros((n_samples, self.n_components))
         
-        # For each data point
-        for i in range(n_samples):
-            # For each component
-            for k in range(self.n_components):
-                # Compute π_k * N(x_i | μ_k, Σ_k)
-                try:
-                    pdf_value = multivariate_normal.pdf(X[i], mean=self.mu_[k], cov=self.cov_[k])
-                    responsibilities[i, k] = self.pi_[k] * (M + np.log(np.exp(pdf_value - M)))
-                except np.linalg.LinAlgError:
-                    # Covariance became singular
-                    responsibilities[i, k] = 0.0
+        # For each component
+        for k in range(self.n_components):
+            # Compute π_k * N(x_i | μ_k, Σ_k)
+            try:
+                log_pdf = np.log(multivariate_normal.pdf(X, mean=self.mu_[k], cov=self.cov_[k]))
+                log_responsibilities[:, k] = np.log(self.pi_[k]) + log_pdf
+            except np.linalg.LinAlgError:
+                # Covariance became singular
+                pass
         
-        # Normalize each row to sum to 1
-        for i in range(n_samples):
-            row_sum = responsibilities[i, :].sum()
-            if row_sum > 0:
-                responsibilities[i, :] /= row_sum
-            else:
-                # If all responsibilities are 0, assign uniformly
-                responsibilities[i, :] = 1.0 / self.n_components
-        
+        # Log-sum-exp normalization
+        max_log_resp = np.max(log_responsibilities, axis=1, keepdims=True)
+        log_sum_exp = max_log_resp + np.log(np.sum(np.exp(log_responsibilities - max_log_resp), axis=1, keepdims=True))
+        responsibilities = np.exp(log_responsibilities - log_sum_exp)
+
+        # Handle all -inf cases
+        zero_mask = np.all(np.isinf(log_responsibilities), axis=1)
+        responsibilities[zero_mask, :] = 1.0 / self.n_components
+
         return responsibilities
     
     def _m_step(self, X, responsibilities):
@@ -175,42 +173,29 @@ class GaussianMixtureModel:
         """
         n_samples, n_features = X.shape
         
-        # Initialize new parameters
-        mu_new = []
-        cov_new = []
-        pi_new = np.zeros(self.n_components)
+        # Vectorized computation of N_k
+        N_k = responsibilities.sum(axis = 0)
         
-        # For each component
+        # Mixing proportions
+        pi_new = N_k / n_samples
+
+        # Update means
+        mu_new = (responsibilities.T @ X) / N_k[:, np.newaxis]
+
+        # Update covariances
+        cov_new = []
         for k in range(self.n_components):
-            # Compute N_k = sum of responsibilities for component k
-            N_k = 0.0
-            for i in range(n_samples):
-                N_k += responsibilities[i, k]
-            
-            # Update mixing proportion
-            pi_new[k] = N_k / n_samples
-            
-            # Update mean
-            mu_k = np.zeros(n_features)
-            for i in range(n_samples):
-                mu_k += responsibilities[i, k] * X[i]
-            mu_k /= N_k
-            mu_new.append(mu_k)
-            
-            # Update covariance
-            cov_k = np.zeros((n_features, n_features))
-            for i in range(n_samples):
-                diff = X[i] - mu_k
-                cov_k += responsibilities[i, k] * np.outer(diff, diff)
-            cov_k /= N_k
-            
-            # Add small regularization to prevent singularity
+
+            # Compute differences from mean for all samples
+            diff = X - mu_new[k]
+            weighted_diff = diff * responsibilities[:, k, np.newaxis]
+            cov_k = (weighted_diff.T @ diff) / N_k[k]
             cov_k += 1e-6 * np.eye(n_features)
             cov_new.append(cov_k)
-        
+
         # Update stored parameters
         self._set_parameters(
-            mu_new,
+            list(mu_new),
             cov_new,
             pi_new
         )
